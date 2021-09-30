@@ -1,0 +1,569 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Main program body
+  ******************************************************************************
+  * @attention
+  *
+  * <h2><center>&copy; Copyright (c) 2021 STMicroelectronics.
+  * All rights reserved.</center></h2>
+  *
+  * This software component is licensed by ST under BSD 3-Clause license,
+  * the "License"; You may not use this file except in compliance with the
+  * License. You may obtain a copy of the License at:
+  *                        opensource.org/licenses/BSD-3-Clause
+  *
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+/* Includes ------------------------------------------------------------------*/
+#include "main.h"
+#include "dma.h"
+#include "tim.h"
+#include "usart.h"
+#include "gpio.h"
+
+/* Private includes ----------------------------------------------------------*/
+/* USER CODE BEGIN Includes */
+#include "motor.h"
+#include "stm32l4xx_hal.h"
+#include "stm32l4xx_it.h"
+#include "sonerer.h"
+#include <stdio.h>
+#include "string.h"
+#include "gps.h"
+#include "math.h"
+#define PI 3.1415926535898
+/* USER CODE END Includes */
+
+/* Private typedef -----------------------------------------------------------*/
+/* USER CODE BEGIN PTD */
+
+/* USER CODE END PTD */
+
+/* Private define ------------------------------------------------------------*/
+/* USER CODE BEGIN PD */
+/* USER CODE END PD */
+
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+#define u8 uint8_t
+#define u16 uint16_t
+#define speed 800//车速
+uint16_t count;
+uint16_t distance;
+uint16_t  time;
+uint16_t i;
+#define RXBUFFERSIZE  256     //最大接收字节数
+char RxBuffer[RXBUFFERSIZE];   //接收数据
+uint8_t aRxBuffer;			//接收中断缓冲
+uint8_t Uart1_Rx_Cnt = 0;		//接收缓冲计数
+
+u8 rdata[1];
+u8 rrdata[1];
+u8 rdata1[1];
+u16 point;
+char station,mode;
+#define RX_BUF_MAXLEN 200
+char USART_RX_BUF[RX_BUF_MAXLEN];
+char USER_RX_BUF[RX_BUF_MAXLEN];
+
+char gps_info[16][20];    //gps字段
+extern UART_HandleTypeDef huart1;
+uint8_t ch;
+double userlat,userlot;
+int fputc(int c, FILE * f)
+{
+ch=c;
+HAL_UART_Transmit(&huart1,&ch,1,1000);//发送串口
+return c;
+}
+int fgetc(FILE * f)
+{
+  uint8_t ch_r = 0;
+  HAL_UART_Receive(&huart1,&ch_r,1, 0xffff);
+  return ch_r;
+}
+
+
+//计算航向角
+struct PointLB
+	{
+    double lat;
+    double lon;
+};
+double getAzimuth(struct PointLB pA, struct PointLB pB)
+{   
+    pA.lat=((double)*GPSData.userDataN/100);pA.lon=((double)*GPSData.userDataE/100);
+	  pB.lat=((double)*GPSData.latitude/100);pB.lon=((double)*GPSData.longitude/100);	
+    double a = (90 - pB.lat) * PI / 180;
+    double b = (90 - pA.lat) * PI / 180;
+    double AOC_BOC = (pB.lon - pA.lon) * PI / 180;
+    double cosc = cos(a) * cos(b) + sin(a) * sin(b) * cos(AOC_BOC);
+    double sinc = sqrt(1 - cosc * cosc);
+    double sinA = sin(a) * sin(AOC_BOC) / sinc;
+    double A = asin(sinA) * 180 / PI;
+    double res = 0;
+    if (pB.lon > pA.lon && pB.lat > pA.lat) res = A;
+    else if (pB.lon > pA.lon && pB.lat < pA.lat) res = 180 - A;
+    else if (pB.lon < pA.lon && pB.lat < pA.lat) res = 180 - A;
+    else if (pB.lon < pA.lon && pB.lat > pA.lat) res = 360 + A;
+    else if (pB.lon > pA.lon && pB.lat == pA.lat) res = 90;
+    else if (pB.lon < pA.lon && pB.lat == pA.lat) res = 270;
+    else if (pB.lon == pA.lon && pB.lat > pA.lat) res = 0;
+    else if (pB.lon == pA.lon && pB.lat < pA.lat) res = 180;
+    return res;
+}
+
+//角度校准
+void checkangle(void)
+{   float timer,piner;
+		struct PointLB pA;
+		struct PointLB pB;
+		pA.lat=((double)*GPSData.userDataN);pA.lon=((double)*GPSData.userDataE);
+	  pB.lat=((double)*GPSData.latitude/100);pB.lon=((double)*GPSData.longitude/100);	
+    getAzimuth(pA,pB);
+	  piner=getAzimuth(pA,pB)-(double)*GPSData.angle;
+		timer=360/6.9*piner;
+	printf("%f",piner);
+	  if(piner>0)
+		{  
+			CarTurnRight();
+			CarForward(speed,speed,speed,speed);
+			delay_us(timer);
+		}
+		if(piner<0)
+		{  
+			CarTurnLeft();
+			CarForward(speed,speed,speed,speed);
+			delay_us(timer);
+		}
+}
+//避障
+char x,y;
+void blocked()
+{
+	float piner;
+		struct PointLB pA;
+		struct PointLB pB;
+		pA.lat=((double)*GPSData.userDataN);pA.lon=((double)*GPSData.userDataE);
+	  pB.lat=((double)*GPSData.latitude/100);pB.lon=((double)*GPSData.longitude/100);	
+	  getAzimuth(pA,pB);
+   	piner=getAzimuth(pA,pB)-(double)*GPSData.angle;
+		  if(piner>0)
+		{  
+			CarTurnRight();
+			CarForward(speed,speed,speed,speed);
+			while(getdistance()<15);
+			CarTurnForward();
+			CarForward(speed,speed,speed,speed);
+			HAL_Delay(1000);
+      if(getdistance()<15)
+			{
+				blocked();
+			}
+		}
+		if(piner<0)
+		{  
+			CarTurnLeft();
+			CarForward(speed,speed,speed,speed);
+			while(getdistance()<15);
+			CarTurnForward();
+			CarForward(speed,speed,speed,speed);
+			HAL_Delay(1000);
+      if(getdistance()<15)
+     {
+				blocked();
+			}
+		}
+}
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+/*
+
+*/
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
+
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  * @retval int
+  */
+int main(void)
+{
+  /* USER CODE BEGIN 1 */ 
+  /* USER CODE END 1 */
+
+  /* MCU Configuration--------------------------------------------------------*/
+
+  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
+  HAL_Init();
+
+  /* USER CODE BEGIN Init */
+
+  /* USER CODE END Init */
+
+  /* Configure the system clock */
+  SystemClock_Config();
+
+  /* USER CODE BEGIN SysInit */
+
+  /* USER CODE END SysInit */
+
+  /* Initialize all configured peripherals */
+  MX_GPIO_Init();
+  MX_DMA_Init();
+  MX_TIM2_Init();
+  MX_TIM3_Init();
+  MX_TIM4_Init();
+  MX_USART1_UART_Init();
+  MX_USART2_UART_Init();
+  MX_USART3_UART_Init();
+  MX_TIM1_Init();
+  /* USER CODE BEGIN 2 */
+	GPSData.isGetData=false;
+	printf("开始定位\n");
+	HAL_TIM_Base_Start_IT(&htim4);
+  /* USER CODE END 2 */
+
+  /* Infinite loop */
+  /* USER CODE BEGIN WHILE */
+	HAL_UART_Receive_IT(&huart2,(u8*)&rdata,1);
+ //等待定位成功
+//	while(GPSData.isGetData==false)
+	{	
+		printf("正在校准");
+		 printf("GPS%s",GPSData.GPS_Buffer);
+		CarTest(speed);
+	}
+	printf("定位成功，正在待命");
+	HAL_UART_Receive_IT(&huart1, (uint8_t *)&aRxBuffer, 1);
+	CarStop();
+ /* USER CODE END 2 */
+
+ /* Infinite loop */
+ /* USER CODE BEGIN WHILE */
+ while (1)
+ {
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+//	 CarTest(speed);
+//	 parseGPS();
+//	 printf("正在进行一次定位\n");
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+//	 printf("数据%s",RxBuffer);
+//	 printf("GPS%s",GPSData.GPS_Buffer);
+//	 printf("数据提取结果:纬度%s\n\r",GPSData.latitude);
+//	 printf("经度:%s\n\r",GPSData.longitude);
+//	 printf("航向角:%s\n\r",GPSData.angle);
+	 
+HAL_Delay(1000);
+	 if(getdistance()<15)
+	 {
+		 CarStop();
+	 }
+	 else if(getdistance()>15)
+	 {
+		 CarTest(8000);
+	 }
+//if(getdistance()<15)
+//{
+//	blocked();
+//}
+}
+  /* USER CODE END 3 */
+}
+
+/**
+  * @brief System Clock Configuration
+  * @retval None
+  */
+void SystemClock_Config(void)
+{
+  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+  RCC_PeriphCLKInitTypeDef PeriphClkInit = {0};
+  RCC_CRSInitTypeDef RCC_CRSInitStruct = {0};
+
+  /** Configure the main internal regulator output voltage
+  */
+  if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Initializes the RCC Oscillators according to the specified parameters
+  * in the RCC_OscInitTypeDef structure.
+  */
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI48|RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSI48State = RCC_HSI48_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = 2;
+  RCC_OscInitStruct.PLL.PLLN = 18;
+  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+  RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
+  RCC_OscInitStruct.PLL.PLLR = RCC_PLLR_DIV2;
+  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Initializes the CPU, AHB and APB buses clocks
+  */
+  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
+                              |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
+  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV2;
+  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV1;
+
+  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USART1|RCC_PERIPHCLK_USART2
+                              |RCC_PERIPHCLK_USART3;
+  PeriphClkInit.Usart1ClockSelection = RCC_USART1CLKSOURCE_PCLK2;
+  PeriphClkInit.Usart2ClockSelection = RCC_USART2CLKSOURCE_PCLK1;
+  PeriphClkInit.Usart3ClockSelection = RCC_USART3CLKSOURCE_PCLK1;
+  if (HAL_RCCEx_PeriphCLKConfig(&PeriphClkInit) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /** Enable the SYSCFG APB clock
+  */
+  __HAL_RCC_CRS_CLK_ENABLE();
+  /** Configures CRS
+  */
+  RCC_CRSInitStruct.Prescaler = RCC_CRS_SYNC_DIV1;
+  RCC_CRSInitStruct.Source = RCC_CRS_SYNC_SOURCE_LSE;
+  RCC_CRSInitStruct.Polarity = RCC_CRS_SYNC_POLARITY_RISING;
+  RCC_CRSInitStruct.ReloadValue = __HAL_RCC_CRS_RELOADVALUE_CALCULATE(48000000,32768);
+  RCC_CRSInitStruct.ErrorLimitValue = 34;
+  RCC_CRSInitStruct.HSI48CalibrationValue = 32;
+
+  HAL_RCCEx_CRSConfig(&RCC_CRSInitStruct);
+}
+
+/* USER CODE BEGIN 4 */
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{  
+	  UNUSED(huart);
+u8 rec;
+	if(huart->Instance==USART2)
+	{ 
+		rec=rdata[0];
+		if(rec=='$')
+		{
+			point=0;
+		}
+		USART_RX_BUF[point++]=rec;
+		if(USART_RX_BUF[0]=='$'&&USART_RX_BUF[4]=='M'&&USART_RX_BUF[5]=='C')
+		{
+			if(rec=='\n')
+			{
+				memset(GPSData.GPS_Buffer,0,GPS_Buffer_Length);
+				memcpy(GPSData.GPS_Buffer,USART_RX_BUF,point);
+				memset(USART_RX_BUF,0,RX_BUF_MAXLEN);
+				point=0;
+				parseGPS();
+			}
+		}
+		if(point>=RX_BUF_MAXLEN)
+		{
+			point=RX_BUF_MAXLEN;
+		}
+		HAL_UART_Receive_IT(&huart2,(u8*)&rdata,1);
+	}	
+//	 {
+  /* Prevent unused argument(s) compilation warning */
+
+  /* NOTE: This function Should not be modified, when the callback is needed,
+           the HAL_UART_TxCpltCallback could be implemented in the user file
+   */
+   if(huart->Instance==USART1)
+	 {
+		 	if(Uart1_Rx_Cnt >= 255)  //溢出判断
+	{
+		Uart1_Rx_Cnt = 0;
+		memset(RxBuffer,0x00,sizeof(RxBuffer));
+		HAL_UART_Transmit(&huart1, (uint8_t *)"数据溢出", 10,0xFFFF); 	
+        
+	}
+	else
+	{ 
+		RxBuffer[Uart1_Rx_Cnt++] = aRxBuffer;   //接收数据转存
+	  if(RxBuffer[0]=='F')
+		{ 
+			CarTurnForward();
+			CarForward(speed,speed,speed,speed);
+			printf("前进");
+			Uart1_Rx_Cnt = 0;
+			memset(RxBuffer,0x00,sizeof(RxBuffer)); //清空数组
+		}
+		else if(RxBuffer[0]=='L')
+		{ 
+			CarTurnLeft();
+			CarForward(speed,speed,speed,speed);
+			printf("左转");
+			Uart1_Rx_Cnt = 0;
+			memset(RxBuffer,0x00,sizeof(RxBuffer)); //清空数组
+		}	
+		else if(RxBuffer[0]=='R')
+		{ 
+			CarTurnRight();
+			CarForward(speed,speed,speed,speed);
+			printf("右转");
+			Uart1_Rx_Cnt = 0;
+			memset(RxBuffer,0x00,sizeof(RxBuffer)); //清空数组
+		}
+		else if(RxBuffer[0]=='B')
+		{
+			CarTurnBackward();
+			CarForward(speed,speed,speed,speed);
+			printf("后退");
+			Uart1_Rx_Cnt = 0;
+			memset(RxBuffer,0x00,sizeof(RxBuffer)); //清空数组
+		}
+		else if(RxBuffer[0]=='S')
+		{
+			CarStop();
+			printf("停止");
+			Uart1_Rx_Cnt = 0;
+			memset(RxBuffer,0x00,sizeof(RxBuffer)); //清空数组
+		}
+
+//			printf("%s",RxBuffer); //将收到的信息发送出去
+//      while(HAL_UART_GetState(&huart1) == HAL_UART_STATE_BUSY_TX);//检测UART发送结束
+    else if(RxBuffer[0]=='1')
+		{
+			rec=RxBuffer[0];
+			RxBuffer[Uart1_Rx_Cnt++]=rec;
+			if(rec=='E')
+			{
+				memset(GPSData.userDataB,0,20);
+				memcpy(GPSData.userDataB,RxBuffer,Uart1_Rx_Cnt);
+				memset(RxBuffer,0,RX_BUF_MAXLEN);
+				i=Uart1_Rx_Cnt;
+		for(int i=0;i<=8;i++)
+		{
+			GPSData.userDataN[i]=GPSData.GPS_Buffer[i];
+		}
+		for(int i=0;i<=7;i++)
+		{
+			GPSData.userDataE[i]=GPSData.GPS_Buffer[i+10];
+		}		
+    checkangle();		
+		}
+     HAL_Delay(500);
+		}
+		else
+		{
+			printf("命令错误");
+			memset(RxBuffer,0x00,sizeof(RxBuffer));
+		}
+  
+	HAL_UART_Receive_IT(&huart1, (uint8_t *)&aRxBuffer, 1);   //再开启接收中断
+}
+}
+}
+
+float getdistance(void)
+{
+
+		Trig_H ;
+		delay_us(12);
+		Trig_L ;
+		  //开启定时器
+        HAL_TIM_Base_Start(&htim4); 
+		while( HAL_GPIO_ReadPin (GPIOD ,GPIO_PIN_14) != GPIO_PIN_SET)
+			;
+		__HAL_TIM_SetCounter(&htim4,0);
+	  // printf("准备完毕开始测试\r\n");
+		/* 打开中断，对Echo高电平时间计时 */
+		while(HAL_GPIO_ReadPin (GPIOD ,GPIO_PIN_14) == GPIO_PIN_SET)
+			;
+		//关闭定时器
+		count = __HAL_TIM_GetCounter(&htim4);
+        HAL_TIM_Base_Stop(&htim4);
+	  /* 关闭中断，通过参数time来取得距离参数 */
+    /* USER CODE END WHILE */
+
+    /* USER CODE BEGIN 3 */
+		 distance = (uint16_t )count*0.340/2;
+		 i++;
+		printf("第%d次的距离为 %d cm \n\r",i,distance);
+		return distance;
+	}
+/**
+ * @description: 定时器输出捕获中断
+ * @param {TIM_HandleTypeDef} *htim
+ * @return {*}
+ */
+//void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
+//{
+ // Hcsr04TimIcIsr(htim);
+//}
+
+/**
+ * @description: 定时器溢出中断
+ * @param {*}
+ * @return {*}
+ */
+//void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef* htim)
+//{
+//  Hcsr04TimOverflowIsr(htim);
+//}
+/* USER CODE END 4 */
+
+/**
+  * @brief  This function is executed in case of error occurrence.
+  * @retval None
+  */
+void Error_Handler(void)
+{
+  /* USER CODE BEGIN Error_Handler_Debug */
+  /* User can add his own implementation to report the HAL error return state */
+  __disable_irq();
+ // while (1)
+
+  /* USER CODE END Error_Handler_Debug */
+}
+
+#ifdef  USE_FULL_ASSERT
+/**
+  * @brief  Reports the name of the source file and the source line number
+  *         where the assert_param error has occurred.
+  * @param  file: pointer to the source file name
+  * @param  line: assert_param error line source number
+  * @retval None
+  */
+void assert_failed(uint8_t *file, uint32_t line)
+{
+  /* USER CODE BEGIN 6 */
+  /* User can add his own implementation to report the file name and line number,
+     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
+  /* USER CODE END 6 */
+}
+#endif /* USE_FULL_ASSERT */
+
+/************************ (C) COPYRIGHT STMicroelectronics *****END OF FILE****/
